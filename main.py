@@ -6,6 +6,7 @@ import asyncio
 import os
 import csv
 import timeit
+import datetime
 
 
 cp.set_printoptions(
@@ -48,39 +49,56 @@ async def async_zip(aiter1, aiter2):
 
 class NeuralNetwork:
 
-    def __init__(self,layers,learningRate,activations,lossFunc,clipSize = 2.0,unitTest = False):
+    def __init__(self,layers,networkType,learningRate = 0.01,clipSize = 2.0,trainingSplit = 0.9,unitTest = False,imposedActivations = None,imposedLossFunc = None,regularization=None,regularizationLambda=0.01,threshold = 0.5):
         self.layers = layers
         self.weights = [cp.random.standard_normal(size=(y,x)) for (x,y) in zip(self.layers[1:],self.layers[:-1])] if not unitTest else [cp.array([[0.2, 0.4, 0.1, -0.5],[-0.3, 0.1, 0.2, 0.3]]),cp.array([[0.5, -0.6],[0.1, 0.2],[-0.3, 0.4],[0.2, 0.1]])]
         self.biases = [cp.zeros(x,dtype=cp.float32) for x in self.layers[1:]] if not unitTest else [cp.array([0,0,0,0],dtype=cp.float32),cp.array([0,0],dtype=cp.float32)]
         self.learningRate = learningRate
-        self.activations = activations
+        self.activations = [1 for i in range(len(layers) - 2)]
+        self.networkType = networkType
+        if networkType == "BC":
+            self.activations.append(2)
+            self.lossFunc = 1
+        elif networkType == "MCC":
+            self.activations.append(3)
+            self.lossFunc = 3
+        elif networkType == "MLC":
+            self.activations.append(2)
+            self.lossFunc = 1
+        if imposedActivations != None:
+            self.activations = imposedActivations
+        if imposedLossFunc != None:
+            self.lossFunc = lossFunc
+        self.trainingSplit = trainingSplit
         self.trainingData = ValueError("No training data loaded")
+        self.trainingLabels = ValueError("No training data loaded")
         self.testData = ValueError("No test data loaded")
+        self.testLabels = ValueError("No test data loaded")
         self.clipSize = clipSize
-        self.specialCase = (activations[-1] == 1 and lossFunc == 2) or (activations[-1] == 3 and lossFunc == 3)
-        self.lossFunc = lossFunc
+        self.threshold = threshold
+        self.specialCase = (self.activations[-1] == 2 and self.lossFunc == 1) or (self.activations[-1] == 3 and self.lossFunc == 3)
         self.actvationMap = {
-            1:self.sigmoid,
-            2:self.reLU,
+            1:self.reLU,
+            2:self.sigmoid,
             3:self.softmax
         }
         self.activationsDerivativeMap = {
-            1:self.der_sigmoid,
-            2:self.der_reLU,
+            1:self.der_reLU,
+            2:self.der_sigmoid,
             3:self.der_softmax
         }
         self.lossMap = {
-            1:self.MSE,
-            2:self.BCE,
+            1:self.BCE,
+            2:self.MSE,
             3:self.CCE
         }
         self.lossDerivativeMap = {
-            1:self.der_MSE,
-            2:self.der_BCE,
+            1:self.der_BCE,
+            2:self.der_MSE,
             3:self.der_CCE
         }
         self.lossDerivativeMapSpecial = {
-            2:self.der_BCE_Sigmoid,
+            1:self.der_BCE_Sigmoid,
             3:self.der_CCE_Softmax
         }
 
@@ -190,11 +208,28 @@ class NeuralNetwork:
     def der_CCE_Softmax(output,expected):
         return output - expected
 
-    def loadTrainingData(self,fileName):
+    def loadData(self,fileName):
         allData = cp.loadtxt(fileName,delimiter=",")
-        labels = allData[:,[0]]
-        data = allData[:,1:]
-        print(labels,data)
+        self.data = allData[:,1:]
+        if self.networkType == "BC":
+            self.labels = allData[:,[0]]
+        elif self.networkType == "MCC":
+            temp = allData[:,0]
+            labelMap = {}
+            iter = 0
+            for i in temp:
+                ii = float(i)
+                if ii not in labelMap.keys():
+                    labelMap.setdefault(ii,iter)
+                    iter+=1
+            length = len(labelMap.keys())
+            if length != self.layers[-1]:
+                raise IndexError(f"Size of final layer does not match input labels. {length} labels given but only {self.layers[-1]} final nodes initialized.")
+            self.labels = cp.zeros(shape=(self.data.shape[0],length))
+            for i,v in enumerate(temp):
+                self.labels[i,labelMap[float(v)]] = 1
+            print(self.labels)
+                
 
     def forward(self,data):
         print("before: ",data)
@@ -217,6 +252,33 @@ class NeuralNetwork:
             activations.append(data)
         await asyncio.sleep(0)
         return preactivations,activations
+
+    async def evaluate_gpu(self,data):
+        data = cp.asanyarray(data)
+        for (w,b,activation) in zip(self.weights,self.biases,self.activations):
+            preactivated = cp.dot(data,w) + b
+            data = self.actvationMap[activation](preactivated)
+        await asyncio.sleep(0)
+        return data
+
+    async def evaluateNetwork(self,data,labels):
+        finalLayer = await self.evaluate_gpu(data)
+        total = labels.shape[0]
+        correct = 0
+        if self.networkType == "BC":
+            diff = cp.abs(finalLayer - labels)
+            for i in diff:
+                if i < self.threshold:
+                    correct+=1
+        elif self.networkType == "MCC":
+            diff = finalLayer - labels
+            for i in diff:
+                if cp.min(i) > -self.threshold:
+                    correct += 1    
+        
+        return correct/total
+
+            
 
     async def backpropagate(self,preactivated_neurons,activated_neurons,label):
         loss = self.lossMap[self.lossFunc](activated_neurons[-1],label)
@@ -251,72 +313,118 @@ class NeuralNetwork:
     #     permute = cp.random.permutation(len(data))
     #     return data[permute],lables[permute]
 
-    async def data_generator(self,data,labels,batchSize,stochastic):
-        size = data.shape[0]
+    async def data_generator(self,batchSize,stochastic):
+        data = self.trainingData
+        labels = self.trainingLabels
+        size = data.shape[0]    
         permute = cp.random.permutation(size)
         data = data[permute]
         labels = labels[permute]
-        if not stochastic:
-            size = int(cp.ceil(size / batchSize))
+        if stochastic:
+            batchSize = 1
         for i in range(0,size,batchSize):
-            print (i,i+batchSize,size)
+            e = cp.maximum(cp.minimum(i+batchSize,size-1),0)
+            yield data[i:e],labels[i:e]
 
-    async def train_gpu(self,data,labels,epochs,batchSize,stochastic=False):        
-        data = cp.asanyarray(data)
-        labels = cp.asanyarray(labels)
+    async def train_gpu(self,epochs,batchSize,stochastic=False):        
+        allData = self.data
+        allLabels = self.labels
 
         costs = []
-
+        accuracies = []
         startingCost = 0
 
-        avgLoadTime = 0
+        totalLoadTime = 0
 
         for epoch in range(epochs):
-            t1 = timeit.default_timer()
+            ts = timeit.default_timer()
             
-            permute = cp.random.permutation(len(data))
-            data = data[permute]
-            labels = labels[permute]
+            permute = cp.random.permutation(len(allData))
+            permutedData = allData[permute]
+            permutedLabels = allLabels[permute]
 
+            dataSplitSize = cp.ceil(self.trainingSplit * permutedData.shape[0])
+
+            data = permutedData[:dataSplitSize]
+            labels = permutedLabels[:dataSplitSize]
+            evaluationData = permutedData[dataSplitSize:]
+            evaluationLabels = permutedLabels[dataSplitSize:]
 
             size = data.shape[0]
-            # print(size)
+
+            # print(permutedData.shape,data.shape,labels.shape,evaluationData.shape,evaluationLabels.shape)
+
+
             noBatches = int(cp.ceil(size / batchSize))
 
             if stochastic:
-                batches = cp.array_split(data,size)
-                label_batches = cp.array_split(labels,size)
                 noBatches = size
-            else:
-                batches = cp.array_split(data,noBatches)
-                label_batches = cp.array_split(labels,noBatches)
-        
 
-            # print("batches: ",batches[0],label_batches[0],len(batches),len(label_batches),noBatches,size)
-            
+            t0 = timeit.default_timer()
+
             streams = [cp.cuda.Stream(non_blocking=True) for _ in range(noBatches)]
 
             totalCost = 0
 
-            tasks = []
+
+            if stochastic:
+                batches = cp.array_split(data,size)
+                label_batches = cp.array_split(labels,size)
+            else:
+                batches = cp.array_split(data,noBatches)
+                label_batches = cp.array_split(labels,noBatches)
+
+            t1 = timeit.default_timer()
 
             for i,(batch,label) in enumerate(zip(batches,label_batches)):
-                # print(i,batch,label)
 
                 with streams[i % noBatches]:
                     preactivatedNeurons,activationNeurons = await self.forward_gpu(batch)
+                    t10 = timeit.default_timer()
                     cost,dW,dB = await self.backpropagate(preactivatedNeurons,activationNeurons,label)
+                    t11 = timeit.default_timer()
                 for dw in dW:
-                    # print("Grad norm:", cp.linalg.norm(dw))
                     gradNorm = cp.linalg.norm(dw)
                     if gradNorm > self.clipSize:
                         dw *= self.clipSize
                         dw /= gradNorm
+                t12 = timeit.default_timer()
                 totalCost += cost
                 for k in range(len(self.weights)):
-                    # print("changes: ",dW[k ],dB[k])
                     self.weights[k] -= self.learningRate * dW[k]
-                    self.biases[k] -= self.learningRate * dB[k]  
+                    self.biases[k] -= self.learningRate * dB[k]
+                t13 = timeit.default_timer()
+            t2 = timeit.default_timer()
+
+            with streams[0]:
+                accuracy = await self.evaluateNetwork(evaluationData,evaluationLabels)
+                accuracies.append(accuracy)
+
+            t3 = timeit.default_timer()
+
+            #Redundant as it is not faster
+
+            # iter = 0
+            # async for batch,label in self.data_generator(batchSize,stochastic):
+            #     with streams[iter % noBatches]:
+            #         preactivatedNeurons,activationNeurons = await self.forward_gpu(batch)
+            #         cost,dW,dB = await self.backpropagate(preactivatedNeurons,activationNeurons,label)
+            #     for dw in dW:
+            #         # print("Grad norm:", cp.linalg.norm(dw))
+            #         gradNorm = cp.linalg.norm(dw)
+            #         if gradNorm > self.clipSize:
+            #             dw *= self.clipSize
+            #             dw /= gradNorm
+            #     totalCost += cost
+            #     for k in range(len(self.weights)):
+            #         # print("changes: ",dW[k ],dB[k])
+            #         self.weights[k] -= self.learningRate * dW[k]
+            #         self.biases[k] -= self.learningRate * dB[k]
+            #     iter+= 1
+                
+            
+
+            
             if epoch == 0:
                 startingCost = totalCost/noBatches
             # os.system("cls")
@@ -324,29 +432,45 @@ class NeuralNetwork:
             # print(f"Starting cost: {startingCost}")
             # print(f"Average cost: {totalCost/noBatches}")
             costs.append(totalCost/noBatches)
-            # print("Weights: ")
-            # for i in self.weights:
-            #     print(i)
-            # print("Biases")
-            # for i in self.biases:
-            #     print(i)
-            t2 = timeit.default_timer()
-            avgLoadTime += (t2 - t1)
+            te = timeit.default_timer()
+            totalLoadTime += (te - ts)
+            avgLoadTime = totalLoadTime/(epoch+1)
 
-            print(f"Time per epoch: {t2-t1}")
+            os.system("cls")
+
+            remainingEpochs = epochs - (epoch + 1)
+
+            timeLeft = avgLoadTime * remainingEpochs
+
+            minutes = int(timeLeft / 60)
+            seconds = timeLeft - (minutes*60)
+            
+            timeElapsed = avgLoadTime * (epoch + 1)
+            elapsedMinutes = int(timeElapsed / 60)
+            elapsedSeconds = timeElapsed - (elapsedMinutes * 60)
+
+            print(f"Epoch Number: {epoch}")
+            print(f"Time elapsed: {elapsedMinutes}m:{elapsedSeconds:.0.1f}s")
+            print(f"Estimated Time remaining: {minutes}m:{seconds:.01f}s")
+            print(f"\tTime to permute: {t0-ts}")
+            print(f"\tTime to split data: {t1-t0}")
+            print(f"\tTime to backprop: {t2-t1}")
+            print(f"\t\tTime to forward pass: {t10-t1}")
+            print(f"\t\tTime to backpropagate: {t11-t10}")
+            print(f"\t\tTime to update weights: {t13-t12}")
+            print(f"\tTime to test accuracy: {t3-t2}")
+
 
         x = [i for i in range(epochs)]
-        y = costs
+        y1 = costs
+        y2 = accuracies
 
-        print(f"Average epoch time: {avgLoadTime/epochs}")
+        print(f"Average epoch time: {totalLoadTime/epochs}")
 
-        return x,y
+        return x,y1,y2
 
-    def train(self,data,batchSize,epochs):
-        self.train_gpu(data,)
-
-layers = np.array([2,8,4,1])
-activations = np.array([2,2,1])
+layers = np.array([2,8,8,4,2])
+# activations = np.array([2,2,1])
 lossFunc = 2
 
 '''
@@ -387,9 +511,11 @@ labels = cp.array(labels)
 streamm = cp.cuda.Stream(non_blocking=True)
 # network.forward_gpu(data,streamm)
 
-network = NeuralNetwork(layers,0.05,activations,lossFunc,unitTest=False)
+network = NeuralNetwork(layers,networkType="MCC")
 
-dataaa, labless = make_moons(n_samples=500, noise=0.1, random_state=42)
+print(network.layers,[network.actvationMap[i].__name__ for i in network.activations],[i.shape for i in network.weights],[i.shape for i in network.biases])
+
+dataaa, labless = make_moons(n_samples=10000, noise=0.1, random_state=42)
 labless = labless.reshape(-1, 1)
 
 dataaa = cp.array(dataaa.astype(cp.float32))
@@ -397,10 +523,19 @@ labless = cp.array(labless.astype(cp.float32))
 
 print(dataaa[0],labless[0])
 
-# (x1,y1) = asyncio.run(network.train_gpu(dataaa,labless,1,batchSize=256,stochastic=True))
-# x1 = np.asanyarray(x1)
-# y1 = np.asanyarray([i.get() for i in y1])
-# plt.plot(x1,y1)
-# plt.show()
+network.loadData("train.csv")
 
-network.loadTrainingData("train.csv")
+(x1,y1,y2) = asyncio.run(network.train_gpu(3000,batchSize=1024,stochastic=False))
+x1 = np.asanyarray(x1)
+y1 = np.asanyarray([i.get() for i in y1])
+# y2 = np.asanyarray([i.get() for i in y2])
+
+# print(x1)
+# print(y1)
+# print(y2)
+plt.subplot(1,2,1)
+plt.plot(x1,y1)
+plt.subplot(1,2,2)
+plt.ylim(0,1)
+plt.plot(x1,y2)
+plt.show()
